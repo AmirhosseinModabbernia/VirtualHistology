@@ -1,0 +1,176 @@
+## This script takes corticla thickness data and
+#1) does a gamm analysis
+#2) remove outliers and 
+#3) re-does fittings. 
+#4) takes the derivative
+#5) do some plotting if you want
+library(gratia)
+#### set paths and folders ####
+# ............................#
+  ## get packages
+  packages <- c("gridExtra","tidyverse","readxl", "mgcv", "itsadug", "stringi", "schoenberg","scales", "magick","shiny")
+  if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+    install.packages(setdiff(packages, rownames(installed.packages())), INSTALL_opts = c('--no-lock'))  
+  }
+  lapply(packages, require, character.only = T)
+
+  ## set folders
+  wdir <- "~/Documents/Phd/Thesis/ENIGMA"
+  setwd(wdir)
+
+
+  ## load scripts
+  GammPredData = function(data, gamm.model, condition){
+    eval(parse(text=paste0(
+      "get_predictions(gamm.model, cond = list(",
+      condition,
+      "=seq(min(data[condition], na.rm=T),max(data[condition], na.rm=T), length.out = nrow(data)))) %>% as.data.frame() %>% mutate(",
+      str_split(gamm.model$formula, " ")[[2]],"=1)")))
+  }
+    
+
+
+x<-which(table(combined$internal)<100)  #only cohorts with a sample size above 100 will be used
+db.MOAS <- combined[!combined$internal %in% names(x),]
+db.MOAS<-db.MOAS[db.MOAS$age>3 & db.MOAS$age<90,]
+db.MOAS$internal<-as.numeric(db.MOAS$internal)
+db.wd<-db.MOAS
+setwd("/Users/amirhosseinmodabbernia/Documents/Phd/Thesis/ENIGMA")
+########for loop across all 
+knots=5:20
+knotmat100<-matrix(0,34,length(knots))
+iter=0
+for ( i in knots) {
+  iter=iter+1
+  gamm.trajectories <- db.wd %>% 
+    gather(region, CTh,8:41)  %>% 
+    group_by(region) %>% 
+    do(fit = gamm(CTh ~ s(age, bs="bs", k = i) + sex , data =., random = list(internal=~1)))
+  for ( j in 1:34) {
+    knotmat100[j,iter]<-summary(gamm.trajectories$fit[[j]]$gam)[["edf"]]
+  }
+}
+write.csv(knotmat100, "knotmat100edf.csv")
+
+
+
+colnames(knotmat100)<-5:20
+rownames(knotmat100)<-gamm.trajectories$region
+knotmat100adj<-knotmat100
+for ( i in 1:16) {
+  knotmat100adj[,i]=(as.numeric(colnames(knotmat100)[i])-(knotmat100adj[,i]+1))
+}
+
+edfchoice<-c()
+for ( i in 1:34) {
+  edfchoice[i]<-max(which(knotmat100adj[i,]<2))+4 #column number +4 because columns start at 5
+}
+
+Opt.nn <- nrow(db.wd) # number of points in new data.base 
+Opt.age <- seq(min(db.wd$age), max(db.wd$age), length = Opt.nn)
+Opt.agesample <- GammPredData(db.wd, gamm.trajectories$fit[[1]]$gam, "age")$age
+Opt.X <- seq(ceiling(min(Opt.age)), floor(max(Opt.age)), by = 1)
+Opt.ii <- apply(t(Opt.X), 1:2,function(x) which(abs(Opt.age-x)==min(abs(Opt.age-x))))
+Opt.iii <- apply(t(Opt.X), 1:2,function(x) which(abs(x-Opt.agesample)==min(abs(x-Opt.agesample))))
+Opt.iv <-apply(t(Opt.age), 1:2,function(x) which(abs(x-Opt.agesample)==min(abs(x-Opt.agesample))))
+
+
+
+#gamm based on new edfs
+gamm.trajectories2<-list()
+gamm.trajectories2$fit<-list()
+knots<-edfchoice
+iter=0
+for ( i in rownames(knotmat100)) {
+  iter=iter+1
+  gamm.trajectories2$fit[[iter]] = gamm(db.wd[,i] ~ s(age, bs="bs", k = knots[iter]) + sex , data =db.wd, random = list(internal=~1))
+}
+
+for ( i in 1:34) {
+  gamm.trajectories2$fit[[i]]$gam$formula=as.formula(CTh ~ s(age, bs = "bs", k = 12) + sex)
+} ###if we don't change the formula, the below code will give an error when parsing the text
+
+gamm.slope <- lapply(gamm.trajectories2$fit, function(x) fderiv(x, n = Opt.nn, eps = 1e-05))
+
+# get reduced data.frames (i.e. one per year (as determined by Opt.X))
+dbtemp <- list()
+dbtemp[["ders"]] = dbtemp[["cis"]] = dbtemp[["cth"]] 
+for (r in 1:34) {
+  tmp1 <- gamm.slope[[r]]$derivatives$`s(age)`
+  dbtemp[["ders"]] <- rbind(dbtemp[["ders"]], tmp1$deriv[Opt.ii])
+  dbtemp[["cis"]] <- rbind(dbtemp[["cis"]], tmp1$se.deriv[Opt.ii])
+  tmp2 <- GammPredData(db.wd, gamm.trajectories2$fit[[r]]$gam, "age")$fit[Opt.iii]
+  tmp3 <- GammPredData(db.wd, gamm.trajectories2$fit[[r]]$gam, "age")$CI[Opt.iii]
+  dbtemp[["cth"]] <- rbind(dbtemp[["cth"]], tmp2)
+}
+
+dbtemp <- lapply(dbtemp,function(x) {x <- data.frame(t(x), row.names = Opt.X)})
+colnames(dbtemp$ders)<-rownames(knotmat100adj)
+write.csv(dbtemp$ders, "der_thickness_specific_morethan100.csv")
+
+
+
+
+
+########-----------------------------sensitivity analysis to edf parameters------------------#####
+
+
+#gamm based on new edfs
+gamm.trajectories2<-list()
+gamm.trajectories2$fit<-list()
+
+for (knots in c(6:10,12,15,20,40) ) {
+iter=0
+
+for ( i in rownames(knotmat100)) {
+  iter=iter+1
+  gamm.trajectories2$fit[[iter]] = gamm(db.wd[,i] ~ s(age, bs="bs", k = knots) + sex , data =db.wd, random = list(internal=~1))
+}
+
+for ( i in 1:34) {
+  gamm.trajectories2$fit[[i]]$gam$formula=as.formula(CTh ~ s(age, bs = "bs", k = 12) + sex)
+} ###if we don't change the formula, the below code will give an error when parsing the text
+
+gamm.slope <- lapply(gamm.trajectories2$fit, function(x) fderiv(x, n = Opt.nn, eps = 1e-05))
+
+# get reduced data.frames (i.e. one per year (as determined by Opt.X))
+dbtemp <- list()
+dbtemp[["ders"]] = dbtemp[["cis"]] = dbtemp[["cth"]]
+for (r in 1:34) {
+  tmp1 <- gamm.slope[[r]]$derivatives$`s(age)`
+  dbtemp[["ders"]] <- rbind(dbtemp[["ders"]], tmp1$deriv[Opt.ii])
+  dbtemp[["cis"]] <- rbind(dbtemp[["cis"]], tmp1$se.deriv[Opt.ii])
+  tmp2 <- GammPredData(db.wd, gamm.trajectories2$fit[[r]]$gam, "age")$fit[Opt.iii]
+  tmp3 <- GammPredData(db.wd, gamm.trajectories2$fit[[r]]$gam, "age")$CI[Opt.iii]
+  dbtemp[["cth"]] <- rbind(dbtemp[["cth"]], tmp2)
+}
+
+dbtemp <- lapply(dbtemp,function(x) {x <- data.frame(t(x), row.names = Opt.X)})
+colnames(dbtemp$ders)<-rownames(knotmat100adj)
+write.csv(dbtemp$ders,paste("thinning_profile",knots,".csv",sep=""))
+
+}
+
+
+a<-read.csv("thinning_profile6.csv")
+b<-read.csv("thinning_profile7.csv")
+c<-read.csv("thinning_profile8.csv")
+d<-read.csv("thinning_profile9.csv")
+e<-read.csv("thinning_profile10.csv")
+f<-read.csv("thinning_profile12.csv")
+g<-read.csv("thinning_profile15.csv")
+h<-read.csv("thinning_profile20.csv")
+i<-read.csv("thinning_profile40.csv")
+j<-read.csv("der_thickness_specific_morethan100.csv")
+v1<-diag(cor(t(j[,-1]),t(a[,-1]))); 
+v2<-diag(cor(t(j[,-1]),t(b[,-1]))); 
+v3<-diag(cor(t(j[,-1]),t(c[,-1])));
+v4<-diag(cor(t(j[,-1]),t(d[,-1]))); 
+v5<-diag(cor(t(j[,-1]),t(e[,-1])));
+v6<-diag(cor(t(j[,-1]),t(f[,-1]))); 
+v7<-diag(cor(t(j[,-1]),t(g[,-1]))); 
+v8<-diag(cor(t(j[,-1]),t(h[,-1]))); 
+v9<-diag(cor(t(j[,-1]),t(i[,-1]))); 
+range(c(v1,v2,v3,v4,v5,v6,v7,v8,v9))
+mean(c(v1,v2,v3,v4,v5,v6,v7,v8,v9))
+write.csv(round(cbind(v1,v2,v3,v4,v5,v6,v7,v8,v9),2),"sensitivty_Parameter.csv")
